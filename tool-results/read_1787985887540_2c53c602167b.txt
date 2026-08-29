@@ -1,0 +1,988 @@
+     1→# ManuOS — Dynamic Workflow Engine Blueprint
+     2→
+     3→**Dokumen**: Comprehensive design untuk dynamic workflow per Order Type
+     4→**Status**: Master blueprint (menggantikan `DYNAMIC_WORKFLOW_DESIGN.md`)
+     5→**Sumber**: Hasil interview proses manufaktur 10 divisi (Marketing → Delivered)
+     6→
+     7→---
+     8→
+     9→## Daftar Isi
+    10→
+    11→1. [Ringkasan Eksekutif](#1-ringkasan-eksekutif)
+    12→2. [Proses Bisnis As-Is (Hasil Interview)](#2-proses-bisnis-as-is-hasil-interview)
+    13→3. [Pemilihan Pendekatan](#3-pemilihan-pendekatan)
+    14→4. [Arsitektur Keseluruhan](#4-arsitektur-keseluruhan)
+    15→5. [Metamodel & Konsep Inti](#5-metamodel--konsep-inti)
+    16→6. [Reference Workflow (DAG)](#6-reference-workflow-dag)
+    17→7. [Hierarki Artefak (Fan-out)](#7-hierarki-artefak-fan-out)
+    18→8. [State Machine](#8-state-machine)
+    19→9. [Katalog Node Components](#9-katalog-node-components)
+    20→10. [Action Components & Trigger](#10-action-components--trigger)
+    21→11. [Semantik Eksekusi Aksi](#11-semantik-eksekusi-aksi)
+    22→12. [Pemetaan Interview → Komponen](#12-pemetaan-interview--komponen)
+    23→13. [Skenario Kunci](#13-skenario-kunci)
+    24→14. [Data Model](#14-data-model)
+    25→15. [Pengalaman Builder untuk End User](#15-pengalaman-builder-untuk-end-user)
+    26→16. [Katalog Event](#16-katalog-event)
+    27→17. [Contoh Konfigurasi](#17-contoh-konfigurasi)
+    28→18. [Strategi Migrasi dari Sistem Saat Ini](#18-strategi-migrasi-dari-sistem-saat-ini)
+    29→19. [Roadmap Implementasi](#19-roadmap-implementasi)
+    30→20. [Risiko & Keputusan Desain Terbuka](#20-risiko--keputusan-desain-terbuka)
+    31→
+    32→---
+    33→
+    34→## 1. Ringkasan Eksekutif
+    35→
+    36→ManuOS saat ini memakai pipeline hardcoded (enum `OrderStatus` tetap: DRAFT → … → DELIVERED). Interview 10 divisi menunjukkan proses nyata **bukan pipeline linear**:
+    37→
+    38→- **Percabangan per part**: assy / machining / standard part punya jalur berbeda.
+    39→- **Penggandaan**: 1 project → 1 MO; 1 drawing → ≥2 operation; 1 operation → 2 jobsheet (produksi + QC pair).
+    40→- **Paralelisme**: Warehouse & Purchasing, Production & Assembly berjalan bersamaan.
+    41→- **Loop-back**: retur → tiket revisi Urgent ke Engineering Design; hasil subcon masuk kembali ke QC.
+    42→- **Integrasi eksternal**: sync Odoo, PR ke Procurement Odoo — jaringan tak selalu andal.
+    43→- **Rule numerik yang bisa berubah**: kapasitas mesin 22 jam/hari, margin material, MoQ.
+    44→- **Perbedaan per order type**: Regular vs Final Part (dan tipe yang akan dibuat user sendiri).
+    45→
+    46→**Keputusan**: bangun **config-driven DAG workflow engine + registry komponen** (node components + action components), dengan **transactional outbox** untuk aksi eksternal. End user menyusun workflow per Order Type lewat builder visual — tanpa menyentuh kode.
+    47→
+    48→> **Node itu wadah, bukan modul.** End user mengustomisasi 3 hal: (1) struktur DAG, (2) komponen di tiap node, (3) aksi di tiap routing/trigger.
+    49→
+    50→---
+    51→
+    52→## 2. Proses Bisnis As-Is (Hasil Interview)
+    53→
+    54→### 2.1 Value stream overview
+    55→
+    56→```mermaid
+    57→flowchart LR
+    58→    A["1. Marketing<br/>Incoming Order + Odoo"] --> B["2. Eng Design<br/>Breakdown + Drawing"]
+    59→    B --> C["3. Eng Process<br/>Operations + CAM"]
+    60→    C --> D["4. PPIC<br/>MO + Jobsheet + Approval"]
+    61→    D --> E["5. Warehouse Material<br/>Stok + Receiving"]
+    62→    E --> F["6. Purchasing<br/>PR + PO + Subcon"]
+    63→    F -.->|material datang| E
+    64→    D --> G["7. Production<br/>Machining + QC"]
+    65→    D --> H["8. Assembly<br/>Ping-pong QC"]
+    66→    G --> I["9. Packing & Shipment"]
+    67→    H --> I
+    68→    I --> J["10. Delivered<br/>Tracking + Retur"]
+    69→    J -.->|tiket revisi Urgent| B
+    70→```
+    71→
+    72→Perhatikan dua **loop** yang membuktikan ini bukan pipeline: `Purchasing → Warehouse` (material kembali) dan `Delivered → Eng Design` (retur).
+    73→
+    74→### 2.2 Detail tiap tahap (ringkasan interview)
+    75→
+    76→| # | Divisi | Input | Aktivitas kunci | Output |
+    77→|---|---|---|---|---|
+    78→| 1 | Marketing | PO customer | Incoming Order (project no auto, tipe Regular/Final Part) → sync Odoo; PO release → SO; Drawing Request | Drawing Request |
+    79→| 2 | Eng Design | Drawing Request | Breakdown Final Part List; klasifikasi assy / machining / standard part | Drawing release 2D + riwayat revisi |
+    80→| 3 | Eng Process | Detail drawing | Sequence, jenis mesin, durasi, operation type; margin material (20×150×5 → 25×175×8); CAM (machining only) | ≥2 operation per drawing |
+    81→| 4 | PPIC | Operations + material | 1 project = 1 MO; cek material; jobsheet = op × 2 (QC pair); routing assy/machining; assign mesin (≤22 jam/hari, pindah = approval); approval 4 tahap (boleh mulai sejak PREPARED/CHECKED) | Jobsheet siap + PR material |
+    82→| 5 | Warehouse Material | Kebutuhan material | Cek stok (ada → kurangi request; habis → PR); receiving → cek → Warehouse Done → *ready to machining*; partial incoming; cacat → ttd 4 divisi; standard part masuk stok, raw tidak | Material ready |
+    83→| 6 | Purchasing | PR | PO vendor (+MoQ), monitor vendor; subcon `SC-` (Preprocess dari Marketing / Process dari PPIC) | PO + material datang |
+    84→| 7 | Production | Jobsheet + material | Start/stop per operation; QC pair inspeksi (termasuk hasil subcon); breakdown → PAUSE atau alih subcon (flag + riwayat posisi) | Part selesai |
+    85→| 8 | Assembly | Jobsheet assy | Ping-pong operator ⇄ QC sampai selesai; durasi total dicatat, operator vs QC terpisah | Assy selesai |
+    86→| 9 | Packing & Shipment | Produk jadi | Packing; tunggu instruksi/approval Marketing; upload bukti (surat jalan/foto/resi) | Bukti kirim |
+    87→| 10 | Delivered | Bukti kirim | Status akhir; public order tracking; retur → replacement; salah gambar/produksi → tiket Urgent ke Eng Design | Order closed |
+    88→
+    89→---
+    90→
+    91→## 3. Pemilihan Pendekatan
+    92→
+    93→### 3.1 Kriteria dari interview
+    94→
+    95→| # | Temuan interview | Implikasi teknis |
+    96→|---|---|---|
+    97→| K1 | Klasifikasi part menentukan jalur | Conditional routing di edge |
+    98→| K2 | Jobsheet = operation × 2 (QC pair) | Fan-out dengan multiplier + pairing |
+    99→| K3 | Warehouse & Purchasing, Production & Assembly paralel | DAG, bukan state list linear |
+   100→| K4 | Retur & subcon kembali ke alur | Loop-back edge (graph bersiklus) |
+   101→| K5 | Regular vs Final Part berbeda; user bisa buat tipe baru | Template per Order Type, versioned |
+   102→| K6 | Odoo bisa down | Aksi eksternal async + retry + idempotent |
+   103→| K7 | 22 jam/hari, margin, MoQ berubah-ubah | Rule numerik = config, bukan kode |
+   104→| K8 | End user (bukan developer) menyusun workflow | Builder visual sederhana, bukan XML/BPMN |
+   105→
+   106→### 3.2 Perbandingan opsi
+   107→
+   108→| Aspek | A. Pipeline hardcoded | B. BPMN engine (Camunda/Flowable) | C. Embed n8n/Zapier | **D. Config-driven DAG + component registry** ✅ |
+   109→|---|---|---|---|---|
+   110→| Percabangan K1 | ❌ hardcode if-else | ✅ | ⚠️ lemah untuk struktur order | ✅ kondisi di edge |
+   111→| Fan-out artefak K2 | ❌ | ⚠️ perlu kustom juga | ❌ tidak kenal artefak manufaktur | ✅ `ARTIFACT_CREATE` + pairing |
+   112→| Paralel K3 | ⚠️ susah | ✅ | ⚠️ | ✅ DAG native |
+   113→| Loop-back K4 | ❌ | ✅ | ⚠️ | ✅ edge type LOOP_BACK |
+   114→| Per order type K5 | ❌ kode baru tiap tipe | ✅ | ⚠️ | ✅ template versioned |
+   115→| Integrasi K6 | manual | ✅ job worker | ✅ | ✅ outbox + retry + idempotency |
+   116→| Rule numerik K7 | ❌ recompile | ⚠️ | ⚠️ | ✅ semua di config JSON |
+   117→| End-user builder K8 | — | ❌ BPMN XML, developer-oriented | ⚠️ terlalu generik | ✅ palet komponen domain (form, approval, jobsheet…) |
+   118→| Infra | ringan | ❌ Zeebe/engine terpisah | ❌ service terpisah | ✅ in-app (Next.js + Prisma + worker) |
+   119→| Artefak domain (MO, Jobsheet, QC pair) | ✅ native | ❌ harus dipetakan | ❌ | ✅ tetap native manuos |
+   120→
+   121→**Kesimpulan**: Opsi D — hybrid. Kita adopsi *ide bagus* dari BPMN engine (definisi berversi, token/token-per-instance, job worker + retry ala Zeebe/outbox) dan dari n8n/Zapier (trigger → actions berurutan dengan shared context), tapi **tanpa** infrastruktur eksternal dan **tanpa** memaksa user belajar notasi BPMN. Domain artefak manufaktur (MO, Jobsheet, QC pair, Drawing) tetap first-class.
+   122→
+   123→---
+   124→
+   125→## 4. Arsitektur Keseluruhan
+   126→
+   127→```mermaid
+   128→flowchart TB
+   129→    subgraph L3["Layer 3 — CONFIGURABLE (dibuat end user per Order Type)"]
+   130→        direction LR
+   131→        WT["Workflow Template<br/>(DAG: nodes + edges + conditions)"]
+   132→        NC["Node Components<br/>(Form, Approval, QC Pattern, ...)"]
+   133→        AC["Action Components<br/>(Odoo, PR, Ledger, Notify, ...)"]
+   134→    end
+   135→
+   136→    subgraph L2["Layer 2 — GLOBAL COMPONENTS (shared services)"]
+   137→        direction LR
+   138→        INV["Inventory Core<br/>(stok, ledger, reservasi)"]
+   139→        SCH["Machine Scheduler<br/>(kapasitas, assign, breakdown)"]
+   140→        PUR["Purchasing Core<br/>(PR, PO, vendor, subcon)"]
+   141→        NUM["Numbering Service<br/>(project no, MO, SC-)"]
+   142→        DOCV["Document Versioning<br/>(revisi drawing)"]
+   143→        ODOO["Odoo Connector"]
+   144→        NT["Notification"]
+   145→        PUB["Public Tracking Portal"]
+   146→        MD["Master Data<br/>(customer, vendor, part, op type)"]
+   147→    end
+   148→
+   149→    subgraph L1["Layer 1 — ENGINE (fixed, di-code sekali)"]
+   150→        direction LR
+   151→        DAG["DAG Executor"]
+   152→        SM["State Machine Runtime"]
+   153→        EVT["Event Bus"]
+   154→        AX["Action Executor<br/>+ Outbox/Worker"]
+   155→        FRM["Form Renderer"]
+   156→        APR["Approval Engine"]
+   157→        RB["RBAC + Tenancy"]
+   158→        AUD["Audit Trail"]
+   159→    end
+   160→
+   161→    WT --> DAG
+   162→    NC --> FRM
+   163→    NC --> APR
+   164→    AC --> AX
+   165→    AX --> ODOO
+   166→    AX --> INV
+   167→    AX --> NT
+   168→    DAG --> EVT
+   169→    EVT --> AX
+   170→    DAG --> SM
+   171→    SM --> AUD
+   172→```
+   173→
+   174→**Aturan praktis**: perilaku yang dibutuhkan ≥ 2 node → global component. Perilaku khas satu jenis tahap → node/action component.
+   175→
+   176→---
+   177→
+   178→## 5. Metamodel & Konsep Inti
+   179→
+   180→```mermaid
+   181→classDiagram
+   182→    class OrderType {
+   183→        +String code
+   184→        +String name
+   185→        +Boolean isActive
+   186→    }
+   187→    class WorkflowTemplate {
+   188→        +Int version
+   189→        +Boolean isActive
+   190→        +publish()
+   191→        +validate()
+   192→    }
+   193→    class WorkflowNodeDef {
+   194→        +String nodeKey
+   195→        +String name
+   196→        +String businessUnitId
+   197→        +Json config
+   198→    }
+   199→    class WorkflowEdgeDef {
+   200→        +String fromNodeId
+   201→        +String toNodeId
+   202→        +Json condition
+   203→        +String edgeType
+   204→    }
+   205→    class NodeComponent {
+   206→        <<palette: FORM, DOCUMENT, APPROVAL, ROUTING, ...>>
+   207→        +String kind
+   208→        +Json config
+   209→        +Int order
+   210→    }
+   211→    class ActionDef {
+   212→        +String triggerType
+   213→        +String kind
+   214→        +Json config
+   215→        +Boolean blocking
+   216→        +Json retry
+   217→    }
+   218→    class Order
+   219→    class WorkflowRun {
+   220→        +String status
+   221→    }
+   222→    class WorkflowNodeRun {
+   223→        +String status
+   224→    }
+   225→    class ComponentRun
+   226→    class ActionRun {
+   227→        +String status
+   228→        +String idempotencyKey
+   229→        +Int attempts
+   230→    }
+   231→
+   232→    OrderType "1" --> "*" WorkflowTemplate : versi
+   233→    WorkflowTemplate "1" --> "*" WorkflowNodeDef : berisi
+   234→    WorkflowTemplate "1" --> "*" WorkflowEdgeDef : berisi
+   235→    WorkflowNodeDef "1" --> "*" NodeComponent : ditempeli
+   236→    WorkflowEdgeDef "1" --> "*" ActionDef : on routing
+   237→    Order "1" --> "1" WorkflowRun : instantiate template aktif
+   238→    WorkflowRun "1" --> "*" WorkflowNodeRun : eksekusi
+   239→    WorkflowNodeRun "1" --> "*" ComponentRun : hasil
+   240→    WorkflowRun "1" --> "*" ActionRun : trigger
+   241→    ActionDef "1" --> "*" ActionRun : dieksekusi sebagai
+   242→```
+   243→
+   244→Konsep kunci:
+   245→
+   246→- **Definisi vs Eksekusi** terpisah total. Template di-edit bebas; run yang sedang jalan **terkunci pada versi template** saat order dibuat.
+   247→- **Node bisa di-instantiate berulang** dalam satu workflow dengan konfigurasi berbeda (terbukti dari interview: "Warehouse" muncul 2× — Material dan Packing/Shipment).
+   248→- **Artifak domain tetap first-class**: MO, Jobsheet, Drawing, PR, PO dibuat *oleh* komponen workflow (FANOUT / DOC_GENERATE), bukan digantikan JSON.
+   249→
+   250→---
+   251→
+   252→## 6. Reference Workflow (DAG)
+   253→
+   254→DAG lengkap hasil interview — inilah "workflow default" untuk Order Type pertama:
+   255→
+   256→```mermaid
+   257→flowchart TD
+   258→    CUST([Customer]) -->|"PO / permintaan"| MKT
+   259→
+   260→    subgraph S1["1 · Marketing"]
+   261→        MKT["Incoming Order<br/>project no auto · customer · produk · qty<br/>tipe Regular / Final Part · req date"]
+   262→        SYNC["Sync ke Odoo (SO)"]
+   263→        REL["PO release<br/>Sales Order resmi"]
+   264→        DR["Drawing Request<br/>part name · part no · qty/batch · target finish"]
+   265→    end
+   266→    MKT --> SYNC
+   267→    MKT --> REL
+   268→    REL --> DR
+   269→    DR --> ENG
+   270→
+   271→    subgraph S2["2 · Engineering Design"]
+   272→        ENG["Breakdown Final Part List"]
+   273→        KLAS{"Klasifikasi part"}
+   274→        DWG["Drawing release 2D<br/>part list (assy) atau material &amp; size (machining)<br/>riwayat revisi"]
+   275→    end
+   276→    ENG --> KLAS
+   277→    KLAS -->|"machining"| DWG
+   278→    KLAS -->|"assy"| DWG
+   279→    KLAS -->|"standard part"| STD["Kebutuhan standard part<br/>(beli jadi: mur, baut)"]
+   280→
+   281→    subgraph S3["3 · Engineering Process"]
+   282→        EPR["Operation per drawing<br/>sequence · jenis mesin · durasi · op type"]
+   283→        MARG["Margin material<br/>20×150×5 → 25×175×8"]
+   284→        CAM["CAM program<br/>(hanya machining)"]
+   285→    end
+   286→    DWG --> EPR
+   287→    EPR --> MARG
+   288→    MARG --> OPS
+   289→    EPR -->|"machining"| CAM
+   290→    CAM -.-> OPS
+   291→    OPS["Operations + kebutuhan material"]
+   292→    EPR -->|"1 drawing → ≥2 operations"| OPS
+   293→
+   294→    subgraph S4["4 · PPIC"]
+   295→        MO["MO · 1 project = 1 MO"]
+   296→        MAT["Cek kebutuhan material<br/>raw + margin · standard part"]
+   297→        JS["Jobsheet = operation × 2<br/>pasangan QC"]
+   298→        ROUT{"Routing jobsheet"}
+   299→        ASG["Assign mesin · durasi · tanggal<br/>kapasitas ≤ 22 jam/hari<br/>pindah mesin → approval + alasan"]
+   300→        APP["Approval 4 tahap<br/>PREPARED → CHECKED → APPROVED → FINAL JUDGE<br/>kerja boleh mulai sejak PREPARED/CHECKED"]
+   301→    end
+   302→    OPS --> MO
+   303→    MO --> MAT
+   304→    MO --> JS
+   305→    JS --> ASG --> APP --> ROUT
+   306→    STD --> MAT
+   307→
+   308→    subgraph S5["5 · Warehouse Material"]
+   309→        STK{"Cek stok aktual"}
+   310→        RECV["Material datang → diterima → dicek<br/>→ Warehouse Done"]
+   311→        PART["Partial incoming<br/>produksi tetap jalan"]
+   312→        DEF["Cacat / kurang →<br/>ttd 4 divisi<br/>PPIC · WH · Purchasing · QC"]
+   313→    end
+   314→    MAT --> STK
+   315→    STK -->|"tersedia"| RESV["Kurangi qty request / reservasi"]
+   316→    STK -->|"habis"| PR
+   317→
+   318→    subgraph S6["6 · Purchasing"]
+   319→        PR["Terima PR"]
+   320→        PO["PO ke vendor<br/>qty + MoQ · monitor vendor"]
+   321→        SPO["PO subcon SC-<br/>Preprocess (dari Marketing) ·<br/>Process (dari PPIC)"]
+   322→    end
+   323→    PR --> PO
+   324→    PO --> VND[[Vendor]]
+   325→    VND --> RECV
+   326→    RECV -.->|"sebagian datang"| PART
+   327→    RECV -.->|"cacat / kurang"| DEF
+   328→    RECV -->|"ready to machining"| GATE["Gate material ready"]
+   329→    RESV --> GATE
+   330→
+   331→    subgraph S7["7 · Production"]
+   332→        RUN["Kerjakan jobsheet machining<br/>catat start / stop"]
+   333→        QCP["Jobsheet QC inspeksi tiap operation<br/>termasuk hasil subcon"]
+   334→        BRK{"Mesin breakdown?"}
+   335→    end
+   336→    GATE --> RUN
+   337→    ROUT -->|"machining"| RUN
+   338→    RUN --> QCP
+   339→    RUN -.->|"saat kerja"| BRK
+   340→    BRK -->|"bisa diperbaiki"| PAU["PAUSE + notif maintenance"]
+   341→    PAU -.->|"diperbaiki → resume"| RUN
+   342→    BRK -->|"tidak bisa"| SUB["Alihkan ke subcon<br/>flag + riwayat posisi terakhir"]
+   343→    SUB --> SPO
+   344→    SPO --> QCP
+   345→
+   346→    subgraph S8["8 · Assembly"]
+   347→        PPNG["Ping-pong operator ⇄ QC<br/>kerja → pause → inspeksi → ulang"]
+   348→        TAT["Total durasi start–end<br/>operator vs QC terpisah"]
+   349→    end
+   350→    ROUT -->|"assy"| PPNG
+   351→    PPNG --> TAT
+   352→
+   353→    subgraph S9["9 · Warehouse Packing &amp; Shipment"]
+   354→        PCK["Packing"]
+   355→        WAI["Menunggu instruksi /<br/>approval Marketing"]
+   356→        UPL["Upload bukti kirim<br/>surat jalan · foto · resi"]
+   357→    end
+   358→    QCP --> PCK
+   359→    TAT --> PCK
+   360→    PCK --> WAI --> UPL
+   361→
+   362→    subgraph S10["10 · Delivered"]
+   363→        DEL["Delivered<br/>public order tracking"]
+   364→        RT{"Retur / komplain"}
+   365→    end
+   366→    UPL --> DEL
+   367→    DEL --> RT
+   368→    RT -->|"penyebab lain"| RPLC["Replacement"]
+   369→    RT -->|"salah gambar / produksi"| URG["Tiket revisi URGENT"]
+   370→    URG -.->|"LOOP-BACK edge"| ENG
+   371→```
+   372→
+   373→Elemen DAG yang **wajib** didukung engine (semua muncul di interview):
+   374→
+   375→| Kemampuan | Contoh di diagram |
+   376→|---|---|
+   377→| Edge bersyarat | `KLAS → machining/assy/standard` |
+   378→| Edge paralel (fan-in) | `QCP + TAT → PCK` |
+   379→| Fan-out multiplier | `JS = operation × 2` |
+   380→| Gate (tunggu event) | `GATE material ready`, `WAI approval Marketing` |
+   381→| Loop-back | `URG -.-> ENG` |
+   382→| Sub-proses per node berulang | S1 vs S9 (Warehouse ×2) |
+   383→
+   384→---
+   385→
+   386→## 7. Hierarki Artefak (Fan-out)
+   387→
+   388→```mermaid
+   389→flowchart TD
+   390→    O["Order / Project (1)"] -->|"1 : 1"| MO["MO"]
+   391→    O --> PL["Final Part List"]
+   392→    PL --> P1["Part: machining"]
+   393→    PL --> P2["Part: assy"]
+   394→    PL --> P3["Part: standard (beli)"]
+   395→    P1 --> D1["Drawing rev 1..n"]
+   396→    D1 -->|"1 : ≥2"| OP1["Op-10 Sawing"]
+   397→    D1 --> OP2["Op-20 Milling"]
+   398→    OP1 -->|"× 2"| JSP["Jobsheet Produksi Op-10"]
+   399→    OP1 --> JQC["Jobsheet QC Op-10 (pair)"]
+   400→    OP2 --> JSP2["Jobsheet Produksi Op-20"]
+   401→    OP2 --> JQC2["Jobsheet QC Op-20 (pair)"]
+   402→    MO --> JSP
+   403→    MO --> JQC
+   404→    MO --> JSP2
+   405→    MO --> JQC2
+   406→    JSP --> T1["MachiningTask · start/stop per mesin"]
+   407→    P3 --> PRQ["PR standard part"]
+   408→```
+   409→
+   410→Poin desain: fan-out menghasilkan **artefak nyata di tabel domain** (MO, Jobsheet, Task), bukan hanya JSON. `WorkflowNodeRun`/`ComponentRun` merekam *siapa membuat apa*, artefak tetap bisa di-query dengan performa tinggi untuk kanban/gantt/report yang sudah ada.
+   411→
+   412→---
+   413→
+   414→## 8. State Machine
+   415→
+   416→### 8.1 Siklus hidup WorkflowNodeRun (generik, untuk semua node)
+   417→
+   418→```mermaid
+   419→stateDiagram-v2
+   420→    [*] --> PENDING : edge masuk terpenuhi
+   421→    PENDING --> ACTIVE : prasyarat OK dan blocking actions sukses
+   422→    PENDING --> SKIPPED : kondisi routing tidak cocok
+   423→    ACTIVE --> WAITING : gate tertutup - material atau approval atau event
+   424→    WAITING --> ACTIVE : gate terbuka
+   425→    ACTIVE --> ON_HOLD : eskalasi atau pause manual
+   426→    ON_HOLD --> ACTIVE : resume
+   427→    ACTIVE --> DONE : exit criteria terpenuhi
+   428→    DONE --> [*]
+   429→    SKIPPED --> [*]
+   430→```
+   431→
+   432→### 8.2 Rantai approval jobsheet (dari interview PPIC)
+   433→
+   434→```mermaid
+   435→stateDiagram-v2
+   436→    [*] --> PREPARED : PPIC membuat jobsheet
+   437→    PREPARED --> CHECKED
+   438→    CHECKED --> APPROVED
+   439→    APPROVED --> FINAL_JUDGE
+   440→    FINAL_JUDGE --> [*] : disetujui penuh
+   441→    PREPARED --> REJECTED : ditolak di tahap mana pun
+   442→    CHECKED --> REJECTED
+   443→    APPROVED --> REJECTED
+   444→    REJECTED --> PREPARED : revisi dan submit ulang
+   445→```
+   446→
+   447→> Pembeda penting: **status approval** dan **status pekerjaan** dua sumbu berbeda. Interview menyebut kerja boleh mulai sejak PREPARED/CHECKED — artinya `WORK_STARTED` tidak menunggu approval selesai.
+   448→
+   449→### 8.3 Siklus kerja jobsheet produksi
+   450→
+   451→```mermaid
+   452→stateDiagram-v2
+   453→    [*] --> NOT_READY : menunggu material
+   454→    NOT_READY --> READY : Warehouse Done
+   455→    READY --> IN_PROGRESS : operator start - sah sejak PREPARED/CHECKED
+   456→    IN_PROGRESS --> PAUSED : breakdown bisa diperbaiki atau ping-pong QC
+   457→    PAUSED --> IN_PROGRESS : perbaikan selesai atau QC lanjut
+   458→    PAUSED --> SUBCON : tidak bisa diperbaiki - dialihkan
+   459→    SUBCON --> QC_IN : hasil subcon kembali
+   460→    QC_IN --> IN_PROGRESS : lolos inspeksi
+   461→    IN_PROGRESS --> COMPLETED : QC pass semua operation
+   462→    COMPLETED --> [*]
+   463→```
+   464→
+   465→---
+   466→
+   467→## 9. Katalog Node Components
+   468→
+   469→Komponen yang ditempel ke node — "apa yang dikerjakan DI DALAM node". Setiap kind punya config schema tervalidasi.
+   470→
+   471→| Kind | Deskripsi | Contoh dari interview |
+   472→|---|---|---|
+   473→| `FORM` | Form dinamis (lanjutan form-templates) | Incoming Order: customer, produk, qty, tipe Regular/Final Part, req date |
+   474→| `DOCUMENT` | Template dokumen + field | Drawing Request; Drawing 2D; surat jalan |
+   475→| `APPROVAL` | Rantai tahap + role + aturan mulai kerja + kebijakan reject | PREPARED → CHECKED → APPROVED → FINAL JUDGE; mulai sejak PREPARED |
+   476→| `ROUTING` | Taksonomi klasifikasi + routing table | assy → Assembly; machining → Production; standard → Purchasing |
+   477→| `CALC` | Formula pada data context | Margin material 20×150×5 → 25×175×8 |
+   478→| `FANOUT` | Multiplier / agregasi / pairing artefak | 1 project = 1 MO; jobsheet = op × 2 QC pair |
+   479→| `QC_PATTERN` | Checklist per operation · ping-pong loop · multi-party signature | Inspeksi tiap op + hasil subcon; ttd 4 divisi |
+   480→| `TIMER` | Mode pencatatan waktu + atribusi | Start/stop machining; operator vs QC terpisah |
+   481→| `EVIDENCE` | Upload wajib (foto, ttd, dokumen) | Surat jalan, foto, resi saat shipment |
+   482→| `INVENTORY_POLICY` | Kebijakan stok & receiving | Standard part masuk stok, raw tidak; partial incoming |
+   483→| `SCHEDULING` | Constraint penjadwalan | Kapasitas ≤ 22 jam/hari; pindah mesin = approval + alasan |
+   484→| `GATE` | Kondisi node boleh dieksekusi | *Ready to machining*; tunggu approval Marketing |
+   485→| `ESCALATION` | Penanganan kejadian luar biasa | Breakdown → PAUSE / subcon; retur → tiket Urgent |
+   486→
+   487→---
+   488→
+   489→## 10. Action Components & Trigger
+   490→
+   491→Aksi = efek samping **saat routing/transisi** — pola *when trigger fires → do a₁, a₂, … → lanjut*.
+   492→
+   493→### 10.1 Empat titik pemicu
+   494→
+   495→```mermaid
+   496→flowchart LR
+   497→    subgraph T["TRIGGER"]
+   498→        T1["EDGE<br/>transisi node A → B<br/>(+ condition)"]
+   499→        T2["NODE_STATE<br/>node capai status<br/>ACTIVE / DONE / SKIPPED"]
+   500→        T3["EVENT<br/>event bus domain"]
+   501→        T4["SCHEDULE<br/>cron / delay<br/>(SLA, reminder)"]
+   502→    end
+   503→    subgraph C["CONTEXT (shared, dot-path)"]
+   504→        CTX["workflowRun state<br/>+ hasil aksi sebelumnya<br/>mis. stockCheck.shortfall"]
+   505→    end
+   506→    subgraph A["ACTIONS (berurutan)"]
+   507→        A1["ODOO_RPC"]
+   508→        A2["PR_CREATE"]
+   509→        A3["LEDGER_POST"]
+   510→        A4["NOTIFY"]
+   511→        A5["DOC_GENERATE"]
+   512→        A6["dll."]
+   513→    end
+   514→    T --> CTX --> A
+   515→```
+   516→
+   517→### 10.2 Katalog action
+   518→
+   519→| Kind | Blocking default | Contoh pemakaian |
+   520→|---|---|---|
+   521→| `ODOO_RPC` | ❌ | Upsert Sales Order saat Incoming Order; update status delivered |
+   522→| `HTTP_REQUEST` | ❌ | Webhook pihak ketiga |
+   523→| `STOCK_CHECK` | ✅ | Warehouse cek kebutuhan → hasil `shortfall` di context |
+   524→| `LEDGER_POST` | ✅ | Material diterima → `IN`; issue → `OUT`; reservasi |
+   525→| `STOCK_RESERVE` | ✅ | Standard part tersedia → reserved |
+   526→| `PR_CREATE` | ✅ | Stok habis → PR ke Purchasing / Odoo Procurement |
+   527→| `PO_CREATE` | ❌ | PO vendor; subcon `SC-` Process/Preprocess |
+   528→| `DOC_GENERATE` | ✅ | Drawing Request, jobsheet, surat jalan |
+   529→| `NUMBER_ALLOCATE` | ✅ | Project number auto; MO-01; prefix `SC-` |
+   530→| `ARTIFACT_CREATE` | ✅ | MO, jobsheet pair, task |
+   531→| `MACHINE_ASSIGN` | ✅ | Assign + validasi kapasitas 22 jam/hari |
+   532→| `APPROVAL_START` | ✅ | Mulai rantai approval jobsheet |
+   533→| `NOTIFY` | ❌ | Material ready → operator; breakdown → maintenance |
+   534→| `CALC_APPLY` | ✅ | Terapkan margin material |
+   535→| `FIELD_SET` | ✅ | Set `readyToMachining = true` |
+   536→| `GATE_OPEN` / `GATE_WAIT` | ✅ | Buka/pasang gate shipment approval |
+   537→| `TRACKING_UPDATE` | ❌ | Update progres public tracking |
+   538→| `AUDIT_LOG` | ❌ | Audit eksplisit (semua aksi sudah otomatis ter-audit) |
+   539→
+   540→> Menambah action baru = daftarkan executor (kontrak: config schema + context in/out). Engine tidak berubah.
+   541→
+   542→---
+   543→
+   544→## 11. Semantik Eksekusi Aksi
+   545→
+   546→### 11.1 Transisi edge: aksi sync (in-transaction) + async (outbox)
+   547→
+   548→```mermaid
+   549→sequenceDiagram
+   550→    autonumber
+   551→    participant E as DAG Executor
+   552→    participant TX as DB Transaksi
+   553→    participant OB as Outbox / ActionRun
+   554→    participant W as Action Worker
+   555→    participant O as Odoo
+   556→
+   557→    E->>TX: BEGIN
+   558→    E->>TX: NodeRun Marketing = DONE
+   559→    E->>TX: Aksi sync DOC_GENERATE (blocking) → row Drawing Request
+   560→    E->>TX: Insert ActionRun ODOO_RPC status PENDING (idempotencyKey K1)
+   561→    E->>TX: COMMIT (perubahan state + outbox dalam SATU transaksi)
+   562→    E->>TX: NodeRun EngDesign = ACTIVE (blocking actions sudah sukses)
+   563→    OB->>W: poll nextRetryAt
+   564→    W->>O: upsert sale.order
+   565→    O-->>W: OK id=123
+   566→    W->>OB: SUCCESS resultJson id=123
+   567→```
+   568→
+   569→### 11.2 Retry dan dead-letter (Odoo down)
+   570→
+   571→```mermaid
+   572→sequenceDiagram
+   573→    autonumber
+   574→    participant W as Worker
+   575→    participant O as Odoo
+   576→    participant AR as ActionRun
+   577→    participant ADM as Admin Tenant
+   578→
+   579→    W->>O: upsert sale.order
+   580→    O--xW: timeout 30 detik
+   581→    W->>AR: RETRYING attempts+1 · nextRetryAt = now + exponential backoff
+   582→    Note over W,AR: ulangi hingga max attempts
+   583→    W->>AR: DEAD setelah retry habis
+   584→    AR->>ADM: alert + panel Action Run gagal (payload + error lengkap)
+   585→    Note over ADM: perbaiki penyebab → tombol Re-enqueue manual<br/>(idempotencyKey mencegah dobel)
+   586→```
+   587→
+   588→### 11.3 Prinsip yang tidak bisa dinegosiasi
+   589→
+   590→| Prinsip | Mekanisme |
+   591→|---|---|
+   592→| **Atomicity** | Perubahan state node + outbox aksi async dalam satu transaksi DB |
+   593→| **Idempotency** | `idempotencyKey = (workflowRunId, actionDefId, triggerContext)` — retry tidak membuat PR/ledger ganda |
+   594→| **Blocking vs fire-and-forget** | `blocking: true` → node tujuan menunggu aksi sukses; `onFailure: BLOCK \| CONTINUE` |
+   595→| **Durability** | Aksi tidak hilang saat app restart (persist di ActionRun, diproses worker) |
+   596→| **Observability** | Setiap eksekusi tercatat: payload, hasil, attempts, error, durasi |
+   597→
+   598→---
+   599→
+   600→## 12. Pemetaan Interview → Komponen
+   601→
+   602→Legenda: 🎛️ dikonfigurasi user · 🌐 global component
+   603→
+   604→| Node | Perilaku interview | Komponen | 
+   605→|---|---|---|
+   606→| Marketing | Form incoming order + project no auto | 🎛️ FORM + NUMBER_ALLOCATE (🌐 numbering) |
+   607→| Marketing | Sync Odoo | 🎛️ ODOO_RPC (🌐 connector + outbox) |
+   608→| Marketing | Drawing Request | 🎛️ DOCUMENT |
+   609→| Eng Design | Breakdown Final Part List | 🎛️ FANOUT |
+   610→| Eng Design | Klasifikasi assy/machining/standard | 🎛️ ROUTING |
+   611→| Eng Design | Riwayat revisi drawing | 🌐 document versioning |
+   612→| Eng Process | Sequence, mesin, durasi, op type | 🎛️ FORM (🌐 master op type) |
+   613→| Eng Process | Margin material | 🎛️ CALC |
+   614→| Eng Process | CAM hanya machining | 🎛️ ROUTING (conditional) |
+   615→| PPIC | 1 project = 1 MO | 🎛️ FANOUT |
+   616→| PPIC | Cek material | 🎛️ STOCK_CHECK (🌐 inventory) |
+   617→| PPIC | Jobsheet ×2 QC pair | 🎛️ FANOUT pairing |
+   618→| PPIC | Routing tujuan jobsheet | 🎛️ ROUTING |
+   619→| PPIC | Assign mesin, 22 jam/hari, pindah = approval | 🎛️ SCHEDULING + APPROVAL (🌐 scheduler) |
+   620→| PPIC | Approval 4 tahap, mulai sejak PREPARED | 🎛️ APPROVAL (🌐 approval engine) |
+   621→| Warehouse | Stok ada/habis → PR | 🎛️ STOCK_CHECK + PR_CREATE |
+   622→| Warehouse | Receiving → Warehouse Done → ready | 🎛️ GATE + LEDGER_POST |
+   623→| Warehouse | Partial incoming | 🎛️ INVENTORY_POLICY |
+   624→| Warehouse | Cacat → ttd 4 divisi | 🎛️ QC_PATTERN multi-party |
+   625→| Purchasing | PR → PO + MoQ | 🎛️ CALC qty + DOCUMENT (🌐 purchasing) |
+   626→| Purchasing | Subcon SC- 2 jenis | 🎛️ NUMBER_ALLOCATE prefix + ROUTING sumber |
+   627→| Production | Start/stop | 🎛️ TIMER |
+   628→| Production | QC inspeksi per op + subcon | 🎛️ QC_PATTERN |
+   629→| Production | Breakdown → PAUSE/subcon | 🎛️ ESCALATION (🌐 machine events) |
+   630→| Assembly | Ping-pong | 🎛️ QC_PATTERN loop |
+   631→| Assembly | Waktu operator vs QC terpisah | 🎛️ TIMER attribution |
+   632→| Packing | Tunggu approval Marketing | 🎛️ GATE + APPROVAL |
+   633→| Packing | Upload bukti | 🎛️ EVIDENCE (🌐 storage) |
+   634→| Delivered | Public tracking | 🌐 portal |
+   635→| Delivered | Retur → tiket Urgent | 🎛️ LOOP_BACK edge + ESCALATION |
+   636→
+   637→---
+   638→
+   639→## 13. Skenario Kunci
+   640→
+   641→### 13.1 Material shortage → PR → receiving → ready
+   642→
+   643→```mermaid
+   644→sequenceDiagram
+   645→    autonumber
+   646→    participant PPIC as PPIC Node
+   647→    participant INV as Inventory Core
+   648→    participant EVT as Event Bus
+   649→    participant ACT as Action Executor
+   650→    participant ODP as Odoo Procurement
+   651→    participant NOT as Notification
+   652→    participant JS as Jobsheet
+   653→
+   654→    PPIC->>INV: STOCK_CHECK (raw + margin, standard part)
+   655→    INV-->>EVT: STOCK_SHORTAGE (shortfall 3 item)
+   656→    EVT->>ACT: trigger EVENT
+   657→    ACT->>ODP: PR_CREATE (blocking) → PR-0456
+   658→    ACT->>INV: LEDGER_POST RESERVATION (qty yang tersedia)
+   659→    ACT->>NOT: NOTIFY Purchasing (PR_CREATED)
+   660→    ACT->>JS: GATE_WAIT MATERIAL_READY
+   661→    Note over JS: produksi jalan dengan partial (sesuai policy)
+   662→    ODP-->>ACT: material datang (partial) → MATERIAL_RECEIVED
+   663→    ACT->>INV: LEDGER_POST IN (partial)
+   664→    ACT->>JS: GATE_OPEN (ready to machining)
+   665→```
+   666→
+   667→### 13.2 Mesin breakdown → PAUSE atau subcon
+   668→
+   669→```mermaid
+   670→flowchart TD
+   671→    BD["Mesin breakdown dilaporkan"] --> Q{"Bisa diperbaiki?"}
+   672→    Q -->|"Ya"| PAU["Jobsheet PAUSE<br/>mesin DOWN + notif maintenance"]
+   673→    PAU --> FIX["Perbaikan selesai"]
+   674→    FIX --> RES["RESUME jobsheet"]
+   675→    Q -->|"Tidak"| SUB["Alihkan ke subcon<br/>PO prefix SC- Process"]
+   676→    SUB --> POS["Flag subcon +<br/>riwayat posisi terakhir"]
+   677→    SUB --> VND[[Vendor subcon]]
+   678→    VND --> QC["Hasil subcon kembali<br/>→ QC pair inspeksi"]
+   679→    QC -->|"lolos"| LANJ["Lanjut alur normal"]
+   680→    QC -->|"gagal"| RET["Rework / koordinasi vendor"]
+   681→```
+   682→
+   683→### 13.3 Assembly ping-pong
+   684→
+   685→```mermaid
+   686→sequenceDiagram
+   687→    autonumber
+   688→    participant OP as Operator
+   689→    participant JS as Jobsheet Assembly
+   690→    participant QC as QC
+   691→    participant TM as Timer
+   692→
+   693→    loop sampai QC menyatakan selesai
+   694→        OP->>JS: start (TM: operator start)
+   695→        OP->>JS: pause (tahap kerja selesai)
+   696→        QC->>JS: inspeksi (TM: QC start)
+   697→        alt hasil OK
+   698→            QC->>JS: lanjut tahap berikut
+   699→        else rework
+   700→            QC->>JS: kembali ke operator + catat alasan
+   701→        end
+   702→    end
+   703→    QC->>JS: declare selesai
+   704→    JS->>TM: total = start–end · split operator vs QC
+   705→```
+   706→
+   707→### 13.4 Retur → tiket revisi Urgent (loop-back)
+   708→
+   709→```mermaid
+   710→flowchart LR
+   711→    DEL["Delivered"] --> RT{"Retur / komplain"}
+   712→    RT -->|"penyebab lain"| REPL["Replacement<br/>(fokus retur)"]
+   713→    RT -->|"salah gambar / produksi"| URG["Tiket revisi prioritas URGENT"]
+   714→    URG -.->|"LOOP-BACK edge<br/>(bukan edge normal)"| ED["Engineering Design"]
+   715→    ED --> DWG2["Drawing revisi baru"]
+   716→    DWG2 --> EPR2["Eng Process update operations"]
+   717→    EPR2 --> PPIC2["Jobsheet revisi (rencana baru)"]
+   718→```
+   719→
+   720→> Loop-back **tidak mengubah** run historis (jobsheet lama tetap tercatat); ia membuat iterasi baru di node tujuan dengan referensi ke tiket retur — pola yang sama dipakai untuk revisi drawing normal.
+   721→
+   722→---
+   723→
+   724→## 14. Data Model
+   725→
+   726→Model inti (ringkas — kolom metadata standar dihilangkan):
+   727→
+   728→```mermaid
+   729→erDiagram
+   730→    TENANT ||--o{ ORDER_TYPE : memiliki
+   731→    ORDER_TYPE ||--o{ WORKFLOW_TEMPLATE : "versi"
+   732→    WORKFLOW_TEMPLATE ||--o{ WORKFLOW_NODE_DEF : berisi
+   733→    WORKFLOW_TEMPLATE ||--o{ WORKFLOW_EDGE_DEF : berisi
+   734→    WORKFLOW_NODE_DEF ||--o{ NODE_COMPONENT : "ditempeli"
+   735→    WORKFLOW_EDGE_DEF ||--o{ ACTION_DEF : "aksi on routing"
+   736→    ORDER ||--|| WORKFLOW_RUN : "instansiasi template aktif"
+   737→    WORKFLOW_RUN ||--o{ WORKFLOW_NODE_RUN : mengeksekusi
+   738→    WORKFLOW_NODE_RUN ||--o{ COMPONENT_RUN : menghasilkan
+   739→    ACTION_DEF ||--o{ ACTION_RUN : "dieksekusi sebagai"
+   740→    WORKFLOW_RUN ||--o{ ACTION_RUN : memicu
+   741→    ORDER ||--o{ MANUFACTURING_ORDER : "fan-out"
+   742→    MANUFACTURING_ORDER ||--o{ JOBSHEET : "fan-out"
+   743→    JOBSHEET ||--o{ MACHINING_TASK : berisi
+   744→
+   745→    ORDER_TYPE {
+   746→        string code "REGULAR, FINAL_PART, custom"
+   747→        string name
+   748→        bool isActive
+   749→    }
+   750→    WORKFLOW_TEMPLATE {
+   751→        int version
+   752→        bool isActive "hanya 1 aktif per order type"
+   753→    }
+   754→    WORKFLOW_NODE_DEF {
+   755→        string nodeKey "warehouse-material, dst"
+   756→        string businessUnitId "divisi pemilik"
+   757→        json config
+   758→    }
+   759→    WORKFLOW_EDGE_DEF {
+   760→        string fromNodeId
+   761→        string toNodeId
+   762→        json condition "mis part.classification"
+   763→        string edgeType "SEQUENTIAL PARALLEL LOOP_BACK EXCEPTION"
+   764→    }
+   765→    NODE_COMPONENT {
+   766→        string kind "FORM APPROVAL ROUTING dll"
+   767→        json config
+   768→        int order
+   769→    }
+   770→    ACTION_DEF {
+   771→        string triggerType "EDGE NODE_STATE EVENT SCHEDULE"
+   772→        string kind "ODOO_RPC PR_CREATE dll"
+   773→        json config
+   774→        bool blocking
+   775→        json retry
+   776→    }
+   777→    WORKFLOW_RUN {
+   778→        string status
+   779→        string templateVersion
+   780→    }
+   781→    WORKFLOW_NODE_RUN {
+   782→        string status "PENDING ACTIVE WAITING DONE SKIPPED"
+   783→    }
+   784→    ACTION_RUN {
+   785→        string status "PENDING RUNNING SUCCESS RETRYING DEAD"
+   786→        string idempotencyKey "unique"
+   787→        int attempts
+   788→        json payload
+   789→        json result
+   790→        datetime nextRetryAt
+   791→    }
+   792→```
+   793→
+   794→Perubahan dari schema saat ini:
+   795→
+   796→1. `Order.status` (enum) → status turunan dari posisi `WorkflowRun` (tetap dipetakan ke label ringkas untuk dashboard/portal).
+   797→2. `Jobsheet.preparedBy/checkedBy/approvedBy` → data `ComponentRun` dari komponen APPROVAL (rantai panjangnya bebas).
+   798→3. MO/Jobsheet/Task **tetap ada** — dibuat oleh komponen, bukan dihapus.
+   799→
+   800→---
+   801→
+   802→## 15. Pengalaman Builder untuk End User
+   803→
+   804→```mermaid
+   805→flowchart LR
+   806→    A["1. Buat / pilih<br/>Order Type"] --> B["2. Susun node<br/>dari katalog node type"]
+   807→    B --> C["3. Tempel komponen<br/>ke tiap node<br/>(form, approval, QC, ...)"]
+   808→    C --> D["4. Gambar edge<br/>+ kondisi routing"]
+   809→    D --> E["5. Klik edge →<br/>tambah actions<br/>(ala Zapier)"]
+   810→    E --> F["6. Validasi &<br/>dry-run data contoh"]
+   811→    F --> G{"Valid?"}
+   812→    G -->|"tidak"| C
+   813→    G -->|"ya"| H["7. Publish<br/>sebagai versi baru"]
+   814→```
+   815→
+   816→Validasi yang dijalankan sebelum publish:
+   817→
+   818→- **Struktur**: semua node terhubung (tidak ada orphan kecuali terminal), ada minimal 1 node start & end, loop-back hanya pada tipe edge yang diizinkan.
+   819→- **Kontrak**: config tiap komponen lolos JSON Schema; referensi dot-path antar aksi (`itemsFrom: "stockCheck.shortfall"`) valid.
+   820→- **Semantik**: tidak ada cycle tanpa exit; aksi blocking tidak saling menunggu (deadlock); setiap `GATE_WAIT` punya minimal satu event pembuka.
+   821→- **Dry-run**: jalankan dengan data contoh → tampilkan DAG yang dilalui + aksi yang terpicu, sebelum template dipakai order nyata.
+   822→
+   823→---
+   824→
+   825→## 16. Katalog Event
+   826→
+   827→| Domain | Event |
+   828→|---|---|
+   829→| Order | `ORDER_CREATED` · `ORDER_RELEASED` · `ORDER_CANCELLED` · `ORDER_DELIVERED` |
+   830→| Engineering | `DRAWING_REQUEST_CREATED` · `DRAWING_RELEASED` · `DRAWING_REVISED` · `OPERATIONS_DEFINED` · `CAM_CREATED` |
+   831→| PPIC | `MO_CREATED` · `JOBSHEET_CREATED` · `JOBSHEET_ROUTED` · `MACHINE_ASSIGNED` · `MACHINE_REASSIGN_REQUESTED` |
+   832→| Approval | `APPROVAL_STAGE_PASSED` · `APPROVAL_REJECTED` · `APPROVAL_COMPLETED` |
+   833→| Material | `STOCK_CHECKED` · `STOCK_SHORTAGE` · `MATERIAL_RESERVED` · `PR_CREATED` · `PO_ISSUED` · `MATERIAL_PARTIAL_RECEIVED` · `MATERIAL_READY` · `MATERIAL_DEFECT_VERIFIED` |
+   834→| Shopfloor | `WORK_STARTED` · `WORK_PAUSED` · `WORK_RESUMED` · `QC_PASSED` · `QC_REJECTED` · `MACHINE_DOWN` · `SUBCON_REDIRECTED` · `SUBCON_RETURNED` |
+   835→| Shipment | `PACKING_DONE` · `SHIPMENT_APPROVED` · `DELIVERY_PROOF_UPLOADED` |
+   836→| Retur | `RETURN_FILED` · `URGENT_REVISION_TICKET` |
+   837→
+   838→Event adalah **bahasa bersama** antara node components, action triggers, dan SLA/schedule triggers.
+   839→
+   840→---
+   841→
+   842→## 17. Contoh Konfigurasi
+   843→
+   844→### 17.1 Node PPIC
+   845→
+   846→```jsonc
+   847→{
+   848→  "nodeKey": "ppic",
+   849→  "businessUnitId": "bu-ppic",
+   850→  "components": [
+   851→    { "kind": "FANOUT", "config": { "rule": "ONE_PER_ORDER", "artifact": "MANUFACTURING_ORDER" } },
+   852→    { "kind": "FANOUT", "config": { "rule": "PER_OPERATION_X2_QC_PAIR", "artifact": "JOBSHEET", "pairType": "PRODUCTION_QC" } },
+   853→    { "kind": "ROUTING", "config": { "mapping": { "machining": "production", "assy": "assembly" } } },
+   854→    { "kind": "SCHEDULING", "config": {
+   855→        "machineCapacityHoursPerDay": 22,
+   856→        "reassignRequiresApproval": true,
+   857→        "reassignReasonRequired": true } },
+   858→    { "kind": "APPROVAL", "config": {
+   859→        "stages": [
+   860→          { "name": "PREPARED", "role": "PPIC" },
+   861→          { "name": "CHECKED", "role": "PPIC_LEAD" },
+   862→          { "name": "APPROVED", "role": "PRODUCTION_MANAGER" },
+   863→          { "name": "FINAL JUDGE", "role": "PLANT_MANAGER" } ],
+   864→        "workMayStartAtStage": "PREPARED",
+   865→        "onReject": "RETURN_TO_STAGE" } }
+   866→  ]
+   867→}
+   868→```
+   869→
+   870→### 17.2 Edge Marketing → Eng Design (dengan actions)
+   871→
+   872→```jsonc
+   873→{
+   874→  "from": "marketing", "to": "eng-design",
+   875→  "condition": { "event": "ORDER_RELEASED" },
+   876→  "actions": [
+   877→    { "kind": "ODOO_RPC", "order": 1, "blocking": false,
+   878→      "config": { "model": "sale.order", "op": "upsert", "fieldMapping": "odoo.so" },
+   879→      "retry": { "max": 5, "backoff": "exponential", "timeoutMs": 30000 } },
+   880→    { "kind": "DOC_GENERATE", "order": 2, "blocking": true,
+   881→      "config": { "template": "drawing-request" } },
+   882→    { "kind": "TRACKING_UPDATE", "order": 3,
+   883→      "config": { "progressLabel": "Masuk Engineering Design" } }
+   884→  ]
+   885→}
+   886→```
+   887→
+   888→### 17.3 Trigger event: stok kurang
+   889→
+   890→```jsonc
+   891→{
+   892→  "on": { "event": "STOCK_SHORTAGE", "scope": "warehouse-material" },
+   893→  "actions": [
+   894→    { "kind": "STOCK_CHECK", "order": 1, "blocking": true,
+   895→      "config": { "itemsFrom": "material.requirements",
+   896→                  "stockPolicy": { "STANDARD_PART": "STOCKED", "RAW_MATERIAL": "NOT_STOCKED" } } },
+   897→    { "kind": "PR_CREATE", "order": 2, "blocking": true,
+   898→      "config": { "target": "odoo-procurement", "itemsFrom": "stockCheck.shortfall" } },
+   899→    { "kind": "LEDGER_POST", "order": 3,
+   900→      "config": { "type": "RESERVATION", "itemsFrom": "stockCheck.available" } },
+   901→    { "kind": "NOTIFY", "order": 4,
+   902→      "config": { "to": ["ROLE_PURCHASING"], "template": "PR_CREATED" } }
+   903→  ]
+   904→}
+   905→```
+   906→
+   907→---
+   908→
+   909→## 18. Strategi Migrasi dari Sistem Saat Ini
+   910→
+   911→```mermaid
+   912→flowchart LR
+   913→    P1["Fase 1<br/>Engine berjalan paralel<br/>order baru pakai workflow<br/>order lama tetap enum"] --> P2["Fase 2<br/>Kanban, Gantt, laporan<br/>dibaca dari WorkflowRun<br/>(kompat layer status)"]
+   914→    P2 --> P3["Fase 3<br/>Modul statis lama<br/>(UI order/jobsheet hardcoded)<br/>digantikan node UI"]
+   915→    P3 --> P4["Fase 4<br/>Enum status dihapus<br/>semua tenant pakai<br/>workflow template"]
+   916→```
+   917→
+   918→- **Kompat layer**: `Order.status` tetap terisi (dipetakan dari posisi WorkflowRun) supaya dashboard, portal, dan laporan yang ada tidak rusak di fase transisi.
+   919→- **Modul yang tetap dipakai apa adanya**: machine management, inventory, audit, auth — tinggal dibungkus jadi global components.
+   920→
+   921→---
+   922→
+   923→## 19. Roadmap Implementasi
+   924→
+   925→```mermaid
+   926→gantt
+   927→    title Roadmap indikatif (durasi relatif, bukan tanggal komitmen)
+   928→    dateFormat YYYY-MM-DD
+   929→    axisFormat %b
+   930→    section Fondasi
+   931→    Workflow engine DAG + state machine        :f1, 2026-01-05, 25d
+   932→    OrderType + template versioning            :f2, after f1, 15d
+   933→    section Action Framework
+   934→    Trigger + outbox + retry + idempotency     :a1, after f2, 20d
+   935→    NOTIFY + panel ActionRun                   :a2, after a1, 10d
+   936→    section Komponen Inti
+   937→    FORM + DOCUMENT + numbering                :c1, after a2, 20d
+   938→    APPROVAL + ROUTING + FANOUT                :c2, after c1, 20d
+   939→    section Material Loop
+   940→    INVENTORY + PR/PO + Odoo RPC + GATE        :m1, after c2, 25d
+   941→    section Shopfloor
+   942→    TIMER + QC_PATTERN + SCHEDULING            :s1, after m1, 25d
+   943→    section Ketahanan
+   944→    ESCALATION + loop-back + SLA schedule      :k1, after s1, 15d
+   945→    section Builder
+   946→    Visual workflow builder UI + validasi      :b1, after k1, 30d
+   947→```
+   948→
+   949→| Fase | Deliverable | Gerbang keluar (definition of done) |
+   950→|---|---|---|
+   951→| Fondasi | Engine + versioning | 1 order type end-to-end 2 node sederhana di production |
+   952→| Action framework | Trigger + outbox | Aksi Odoo gagal → auto-retry → panel admin → re-enqueue manual, tanpa data ganda |
+   953→| Komponen inti | FORM/DOCUMENT/APPROVAL/ROUTING/FANOUT | Node PPIC penuh (jobsheet ×2 + approval 4 tahap) berjalan dari config |
+   954→| Material loop | INVENTORY + PR/PO + Odoo + GATE | Skenario 13.1 (shortage → ready) lulus uji |
+   955→| Shopfloor | TIMER + QC + SCHEDULING | Skenario 13.2 & 13.3 lulus uji |
+   956→| Ketahanan | ESCALATION + loop-back | Skenario 13.4 (retur → revisi Urgent) lulus uji |
+   957→| Builder | UI visual | Admin tenant non-teknis membuat order type baru tanpa bantuan developer |
+   958→
+   959→> Urutan ini disengaja: **builder UI paling akhir**. Kontrak komponen dan engine harus stabil dulu; kalau tidak, UI builder akan dirombak berulang kali.
+   960→
+   961→---
+   962→
+   963→## 20. Risiko & Keputusan Desain Terbuka
+   964→
+   965→### 20.1 Risiko
+   966→
+   967→| Risiko | Mitigasi |
+   968→|---|---|
+   969→| Workflow misconfigured membuat order macet | Validasi publish + dry-run + deteksi deadlock + alert node WAITING terlalu lama |
+   970→| Aksi ganda (double-PR, ledger dobel) | IdempotencyKey unik + eksekusi single-worker per key |
+   971→| Performa (run table membesar) | Indeks per tenant/run; arsip run selesai; artefak domain tetap tabel normal |
+   972→| Kompleksitas builder mengagetkan user | Mulai dari template siap-pakai (reference workflow §6) yang bisa di-copy lalu dimodifikasi |
+   973→| Perubahan template vs order berjalan | Run terkunci versi; template baru berlaku untuk order berikutnya |
+   974→
+   975→### 20.2 Pertanyaan untuk dikonfirmasi ke user/bisnis
+   976→
+   977→1. **Odoo**: semua tenant pakai Odoo, atau perlu mode tanpa ERP (PR/PO internal penuh)?
+   978→2. **Siapa workflow designer**: role baru `WORKFLOW_DESIGNER`? Per-tenant atau global?
+   979→3. **Standard part**: cukup routing langsung ke Purchasing (tanpa node tersendiri), atau perlu node proses tersendiri?
+   980→4. **CAM**: perlu approval tersendiri sebelum release ke shopfloor?
+   981→5. **Retensi ActionRun** berapa lama (audit vs storage)?
+   982→6. **Batas ukuran template**: max node/komponen per workflow (guardrail performa)?
+   983→7. **SLA numeric per node** (jam) — apakah dibutuhkan di rilis pertama, atau cukup trigger SCHEDULE?
+   984→
+   985→---
+   986→
+   987→*Dokumen ini menjadi single source of truth desain dynamic workflow ManuOS. `DYNAMIC_WORKFLOW_DESIGN.md` (versi awal) dapat diarsipkan.*
+   988→
