@@ -22,14 +22,14 @@ export default function Home() {
   const [showHelp, setShowHelp] = useState(false);
 
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-background">
+    <div className="flex h-screen flex-col bg-background">
       <Toolbar
         onOpenRegistry={() => setShowRegistry(true)}
         onOpenEvents={() => setShowEvents(true)}
         onOpenHelp={() => setShowHelp(true)}
       />
 
-      <div className="flex-1 overflow-hidden">
+      <div className="flex-1 overflow-auto">
         <ResizablePanelGroup direction="horizontal">
           {/* Order types sidebar */}
           <ResizablePanel defaultSize={14} minSize={10} maxSize={20} className="bg-sidebar">
